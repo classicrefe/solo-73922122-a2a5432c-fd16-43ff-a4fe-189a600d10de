@@ -1,0 +1,14 @@
+services:
+  api:
+    build: .
+    container_name: elevation-api
+    ports:
+      - "8000:8000"
+    environment:
+      ELEV_DB_PATH: /data/elev.db
+    volumes:
+      - elev_data:/data
+    restart: unless-stopped
+
+volumes:
+  elev_data:
