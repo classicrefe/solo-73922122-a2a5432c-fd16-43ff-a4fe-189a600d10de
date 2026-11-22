@@ -24,14 +24,19 @@ def create_app(db_path: str | None = None) -> FastAPI:
 
     app = FastAPI(
         title="高程瓦片供数服务",
-        version="1.0.0",
+        version="1.1.0",
         summary="面向坡度分析的高程供数 API",
         description=(
-            "矩形底图按行列划分瓦片，每块 17×17 个整数高程点，相邻块重复存储共边。"
+            "矩形底图按行列划分瓦片，每块 17×17 个整数高程点。"
+            "全图每个坐标（包括瓦片共边与四块交会的角点）只保存一份现行高程，"
+            "单块取数仍返回完整 17×17。"
             "数据员按块暂存修测，再点名一块发版：点名块必须换上最新暂存版，"
             "其余块可保留或换上各自最新暂存版，服务自动选出换块最少且所有共边"
             "逐点吻合的方案整批生效；无解时报告冲突边两侧瓦片坐标且不改任何数据。"
-            "暂存、发版、整图取数并发时满足可串行化。"))
+            "暂存、发版、整图取数并发时满足可串行化，高程与版本来自同一次提交。"
+            "\n\n**演示路径**：先 `POST /basemap` 录入，再 `POST /tiles/{row}/{col}/staged` "
+            "暂存修测，`POST /publish` 发版，最后用 `GET /tiles/{row}/{col}`、"
+            "`GET /basemap/window`、`GET /basemap/grid` 取数。"))
 
     @app.exception_handler(ServiceError)
     async def _service_error_handler(_, exc: ServiceError):
@@ -41,6 +46,10 @@ def create_app(db_path: str | None = None) -> FastAPI:
     @app.get("/", include_in_schema=False)
     def root():
         return RedirectResponse("/docs")
+
+    @app.get("/health", tags=["运维"], summary="健康检查")
+    def health():
+        return {"status": "ok"}
 
     # ---- 底图 ------------------------------------------------------------
 

@@ -1,9 +1,16 @@
 """业务层：所有读写都在 SQLite 事务内完成。
 
+存储模型：全图每个坐标（包括相邻瓦片共边上的点、四块交会的角点）在
+elevation 表中只有一行；tile_versions 表保存各块现行版本号；staged 表保存
+按块暂存的 17×17 修测快照。单块取数只按该块的坐标范围查询 elevation，
+不扫描整图。
+
 并发约定（可串行化）：
   * 写操作（录入底图、暂存、发版、重置）一律 BEGIN IMMEDIATE —— 一开始就拿到
     写锁，事务期间其它写者进不来，读者（WAL 模式）读的是一致的旧快照；
   * 读操作（整图/窗口/单块取数）用普通只读事务，看到的是一个一致性快照；
+  * 发版的高程更新、版本号更新、暂存清除在同一个事务里提交，读者看到的高程
+    和版本必然来自同一次提交；
   * 因此任意并发的暂存、发版、取数，其结果总等价于某种依次执行的顺序。
 """
 
@@ -82,22 +89,38 @@ def _check_tile_shape(data):
         raise InvalidShape(f"tile data must be {TILE}x{TILE}")
 
 
-def tiles_from_grid(grid, rows, cols):
-    """把 (16·rows+1)×(16·cols+1) 的整图切成带共边重复的瓦片。"""
+def _grid_shape(grid):
+    """校验整图并返回 (行数, 列数)。"""
     if not grid or any(not isinstance(r, list) or len(r) == 0 for r in grid):
         raise InvalidShape("grid 必须是非空的二维数组")
     gh, gw = len(grid), len(grid[0])
     if any(len(r) != gw for r in grid):
         raise InvalidShape("grid 各行长度不一致")
+    return gh, gw
+
+
+def _dimensions(gh, gw):
+    """由整图尺寸推算瓦片行列数。"""
     if (gh - 1) % 16 != 0 or (gw - 1) % 16 != 0 or gh < 17 or gw < 17:
         raise InvalidShape("grid 尺寸必须是 (16*rows+1) × (16*cols+1)")
-    dr, dc = (gh - 1) // 16, (gw - 1) // 16
+    return (gh - 1) // 16, (gw - 1) // 16
+
+
+def _slice_tile(grid, row, col):
+    return [line[16 * col:16 * col + TILE]
+            for line in grid[16 * row:16 * row + TILE]]
+
+
+def tiles_from_grid(grid, rows, cols):
+    """把 (16·rows+1)×(16·cols+1) 的整图切成带共边重复的瓦片（仅录入时用）。"""
+    gh, gw = _grid_shape(grid)
+    dr, dc = _dimensions(gh, gw)
     if (rows is not None and rows != dr) or (cols is not None and cols != dc):
         raise InvalidShape(f"rows/cols 与整图尺寸不符，整图推算为 {dr}×{dc}")
     tiles = {}
     for r in range(dr):
         for c in range(dc):
-            tiles[(r, c)] = [row[16 * c:16 * c + TILE] for row in grid[16 * r:16 * r + TILE]]
+            tiles[(r, c)] = _slice_tile(grid, r, c)
     return dr, dc, tiles
 
 
@@ -123,7 +146,7 @@ class ElevationService:
             conn.execute("BEGIN IMMEDIATE")
             try:
                 yield conn
-            except Exception:
+            except BaseException:
                 conn.execute("ROLLBACK")
                 raise
             conn.execute("COMMIT")
@@ -156,6 +179,29 @@ class ElevationService:
                 f"瓦片 ({row},{col}) 超出底图范围 {bm['rows']}×{bm['cols']}",
                 row=row, col=col)
 
+    @staticmethod
+    def _versions(conn, rows, cols):
+        versions = {(r, c): 0 for r in range(rows) for c in range(cols)}
+        for t in conn.execute("SELECT row, col, version FROM tile_versions"):
+            versions[(t["row"], t["col"])] = t["version"]
+        return versions
+
+    @staticmethod
+    def _version_matrix(conn, rows, cols):
+        versions = [[0] * cols for _ in range(rows)]
+        for t in conn.execute("SELECT row, col, version FROM tile_versions"):
+            versions[t["row"]][t["col"]] = t["version"]
+        return versions
+
+    @staticmethod
+    def _current_tiles(conn, rows, cols):
+        """把全图高程还原成各块 17×17，供发版规划器使用。"""
+        grid = [[0] * (16 * cols + 1) for _ in range(16 * rows + 1)]
+        for p in conn.execute("SELECT row, col, value FROM elevation"):
+            grid[p["row"]][p["col"]] = p["value"]
+        return {(r, c): _slice_tile(grid, r, c)
+                for r in range(rows) for c in range(cols)}
+
     # ---- 底图 ------------------------------------------------------------
 
     def create_basemap(self, rows, cols, tiles):
@@ -169,6 +215,13 @@ class ElevationService:
         mismatches = find_seam_mismatches(rows, cols, tiles)
         if mismatches:
             raise SeamMismatch("相邻瓦片共边不吻合，拒绝录入", mismatches=mismatches)
+
+        # 接缝已逐点吻合，因此重叠坐标落到全图上的值唯一。
+        points = {}
+        for (r, c), tile in tiles.items():
+            for i in range(TILE):
+                for j in range(TILE):
+                    points[(16 * r + i, 16 * c + j)] = tile[i][j]
         with self._write() as conn:
             if self._basemap_row(conn) is not None:
                 raise BasemapExists("底图已存在；如需重录请先 DELETE /basemap")
@@ -176,14 +229,19 @@ class ElevationService:
                 "INSERT INTO basemap (id, rows, cols, created_at) VALUES (1,?,?,?)",
                 (rows, cols, _now()))
             conn.executemany(
-                "INSERT INTO tiles (row, col, version, data) VALUES (?,?,1,?)",
-                [(r, c, json.dumps(tiles[(r, c)])) for (r, c) in sorted(tiles)])
-        return {"rows": rows, "cols": cols, "tiles": rows * cols}
+                "INSERT INTO elevation (row, col, value) VALUES (?,?,?)",
+                [(gr, gc, points[(gr, gc)]) for (gr, gc) in sorted(points)])
+            conn.executemany(
+                "INSERT INTO tile_versions (row, col, version) VALUES (?,?,1)",
+                [(r, c) for (r, c) in sorted(tiles)])
+        return {"rows": rows, "cols": cols, "tiles": rows * cols,
+                "elevation_points": len(points)}
 
     def reset(self):
         with self._write() as conn:
             conn.execute("DELETE FROM staged")
-            conn.execute("DELETE FROM tiles")
+            conn.execute("DELETE FROM elevation")
+            conn.execute("DELETE FROM tile_versions")
             conn.execute("DELETE FROM basemap")
         return {"status": "reset"}
 
@@ -191,10 +249,8 @@ class ElevationService:
         with self._read() as conn:
             bm = self._require_basemap(conn)
             rows, cols = bm["rows"], bm["cols"]
-            versions = [[0] * cols for _ in range(rows)]
+            versions = self._version_matrix(conn, rows, cols)
             staged_counts = [[0] * cols for _ in range(rows)]
-            for t in conn.execute("SELECT row, col, version FROM tiles"):
-                versions[t["row"]][t["col"]] = t["version"]
             for s in conn.execute(
                     "SELECT row, col, COUNT(*) AS n FROM staged GROUP BY row, col"):
                 staged_counts[s["row"]][s["col"]] = s["n"]
@@ -202,42 +258,51 @@ class ElevationService:
                 "versions": versions, "staged_counts": staged_counts}
 
     def get_tile(self, row, col):
+        """单块取数：只查该块的坐标范围，返回完整 17×17（含共边/角点）。"""
         with self._read() as conn:
             bm = self._require_basemap(conn)
             self._check_coords(bm, row, col)
-            t = conn.execute(
-                "SELECT version, data FROM tiles WHERE row = ? AND col = ?",
-                (row, col)).fetchone()
-        return {"row": row, "col": col, "version": t["version"],
-                "data": json.loads(t["data"])}
+            version = conn.execute(
+                "SELECT version FROM tile_versions WHERE row = ? AND col = ?",
+                (row, col)).fetchone()["version"]
+            points = conn.execute(
+                "SELECT row, col, value FROM elevation "
+                "WHERE row BETWEEN ? AND ? AND col BETWEEN ? AND ?",
+                (16 * row, 16 * row + TILE - 1,
+                 16 * col, 16 * col + TILE - 1)).fetchall()
+        data = [[0] * TILE for _ in range(TILE)]
+        for p in points:
+            data[p["row"] - 16 * row][p["col"] - 16 * col] = p["value"]
+        return {"row": row, "col": col, "version": version, "data": data}
 
     def get_grid(self):
-        """整图取数：把各瓦片拼成 (16·rows+1)×(16·cols+1) 的完整高程面。"""
+        """整图取数：直接读全图高程表，拼成 (16·rows+1)×(16·cols+1)。"""
         with self._read() as conn:
             bm = self._require_basemap(conn)
             rows, cols = bm["rows"], bm["cols"]
             gh, gw = 16 * rows + 1, 16 * cols + 1
             grid = [[0] * gw for _ in range(gh)]
-            versions = [[0] * cols for _ in range(rows)]
-            for t in conn.execute("SELECT row, col, version, data FROM tiles"):
-                data, r, c = json.loads(t["data"]), t["row"], t["col"]
-                versions[r][c] = t["version"]
-                for i in range(TILE):
-                    dst, src, base_c = grid[16 * r + i], data[i], 16 * c
-                    for j in range(TILE):
-                        dst[base_c + j] = src[j]
+            for p in conn.execute("SELECT row, col, value FROM elevation"):
+                grid[p["row"]][p["col"]] = p["value"]
+            versions = self._version_matrix(conn, rows, cols)
         return {"rows": rows, "cols": cols, "grid_rows": gh, "grid_cols": gw,
                 "versions": versions, "grid": grid}
 
     def get_window(self, row0, col0, row1, col1):
-        """跨瓦片取点：返回拼接后整图上 [row0..row1]×[col0..col1]（含端点）。"""
-        full = self.get_grid()
-        max_r, max_c = full["grid_rows"] - 1, full["grid_cols"] - 1
-        if not (0 <= row0 <= row1 <= max_r and 0 <= col0 <= col1 <= max_c):
-            raise WindowOutOfRange(
-                f"窗口 ({row0},{col0})-({row1},{col1}) 超出整图范围 "
-                f"{full['grid_rows']}×{full['grid_cols']}")
-        grid = [row[col0:col1 + 1] for row in full["grid"][row0:row1 + 1]]
+        """跨瓦片取点：只读窗口覆盖的矩形区域，返回 [row0..row1]×[col0..col1]。"""
+        with self._read() as conn:
+            bm = self._require_basemap(conn)
+            max_r, max_c = 16 * bm["rows"], 16 * bm["cols"]
+            if not (0 <= row0 <= row1 <= max_r and 0 <= col0 <= col1 <= max_c):
+                raise WindowOutOfRange(
+                    f"窗口 ({row0},{col0})-({row1},{col1}) 超出整图范围 "
+                    f"{max_r + 1}×{max_c + 1}")
+            grid = [[0] * (col1 - col0 + 1) for _ in range(row1 - row0 + 1)]
+            for p in conn.execute(
+                    "SELECT row, col, value FROM elevation "
+                    "WHERE row BETWEEN ? AND ? AND col BETWEEN ? AND ?",
+                    (row0, row1, col0, col1)):
+                grid[p["row"] - row0][p["col"] - col0] = p["value"]
         return {"row0": row0, "col0": col0, "row1": row1, "col1": col1,
                 "grid": grid}
 
@@ -274,16 +339,25 @@ class ElevationService:
     # ---- 发版 ------------------------------------------------------------
 
     def publish(self, row, col):
-        """点名一块发版：整批原子生效；无解时报冲突边且不改任何状态。"""
+        """点名一块发版：整批原子生效；无解时报冲突边且不改任何状态。
+
+        只更新换版瓦片的版本号，以及高程真正发生变化的全图坐标；
+        未换版瓦片的版本和未受影响的高程点保持原样。
+        """
         with self._write() as conn:
             bm = self._require_basemap(conn)
             rows, cols = bm["rows"], bm["cols"]
             self._check_coords(bm, row, col)
 
-            current, versions = {}, {}
-            for t in conn.execute("SELECT row, col, version, data FROM tiles"):
-                current[(t["row"], t["col"])] = json.loads(t["data"])
-                versions[(t["row"], t["col"])] = t["version"]
+            current = self._current_tiles(conn, rows, cols)
+            versions = self._versions(conn, rows, cols)
+
+            # 现行全图高程（点 -> 值），用于只写真正变化的坐标
+            current_points = {}
+            for (r, c), data in current.items():
+                for i in range(TILE):
+                    for j in range(TILE):
+                        current_points[(16 * r + i, 16 * c + j)] = data[i][j]
 
             staged, staged_ids = {}, {}
             for s in conn.execute(
@@ -309,13 +383,34 @@ class ElevationService:
                          "tile_b": {"row": b[0], "col": b[1]}}
                         for a, b in conflicts])
 
+            # 汇总换版瓦片覆盖的全图坐标。共边点与角点只落一个键；规划器已
+            # 保证相邻换版瓦片在这些点上取值相同，且与未换版一侧的现行值
+            # 一致时无需写入。
+            affected = {}
+            for (r, c) in chosen:
+                data = staged[(r, c)]
+                for i in range(TILE):
+                    for j in range(TILE):
+                        point = (16 * r + i, 16 * c + j)
+                        affected[point] = data[i][j]
+
+            updates = []
+            for (gr, gc), value in affected.items():
+                old = current_points[(gr, gc)]
+                if old != value:
+                    updates.append((value, gr, gc))
+
+            if updates:
+                conn.executemany(
+                    "UPDATE elevation SET value = ? WHERE row = ? AND col = ?",
+                    updates)
+
             changed, cleared = [], []
             for (r, c) in sorted(chosen):
                 new_version = versions[(r, c)] + 1
                 conn.execute(
-                    "UPDATE tiles SET version = ?, data = ? "
-                    "WHERE row = ? AND col = ?",
-                    (new_version, json.dumps(staged[(r, c)]), r, c))
+                    "UPDATE tile_versions SET version = ? "
+                    "WHERE row = ? AND col = ?", (new_version, r, c))
                 sid = staged_ids[(r, c)]
                 conn.execute("DELETE FROM staged WHERE id = ?", (sid,))
                 changed.append({"row": r, "col": c, "version": new_version})
@@ -324,4 +419,5 @@ class ElevationService:
         return {"status": "published",
                 "named_tile": {"row": row, "col": col},
                 "changed_tiles": changed,
-                "cleared_staged_ids": sorted(cleared)}
+                "cleared_staged_ids": sorted(cleared),
+                "updated_elevation_points": len(updates)}
